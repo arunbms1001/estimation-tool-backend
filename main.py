@@ -1,24 +1,28 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from groq import Groq
 import os
 import io
-from dotenv import load_dotenv
 import pymupdf
 import docx
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.units import inch
+from reportlab.lib import colors
 
-# Load environment variables
-load_dotenv()
-
-# Initialize FastAPI app
+# Initialize FastAPI
 app = FastAPI(
     title="Project Estimation API",
     description="AI-powered project estimation engine",
     version="1.0.0"
 )
 
-# Allow frontend to call this API
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,16 +31,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Groq client
+# Groq client
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+client = Groq(api_key=GROQ_API_KEY)
 
-# Request model
+# Models
 class EstimationRequest(BaseModel):
     requirements: str
     hourly_rate: float = 50.0
     currency: str = "USD"
 
-# The core estimation prompt
+class ExportRequest(BaseModel):
+    estimation: str
+    project_name: str = "Project Estimation"
+
+class ExcelExportRequest(BaseModel):
+    estimation: str
+    project_name: str = "Project Estimation"
+
+# Prompt builder
 def build_prompt(requirements: str, hourly_rate: float, currency: str) -> str:
     return f"""
 You are a senior software project estimation expert with 20 years of IT delivery experience.
@@ -73,22 +86,27 @@ Requirements:
 {requirements}
 """
 
-# Route 1 — Estimate from text
+# Routes
+@app.get("/")
+async def root():
+    return {
+        "status": "running",
+        "message": "Project Estimation API is live",
+        "version": "1.0.0"
+    }
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
+
 @app.post("/estimate")
 async def estimate_from_text(request: EstimationRequest):
     if not request.requirements.strip():
         raise HTTPException(status_code=400, detail="Requirements cannot be empty")
-    
     if len(request.requirements) < 20:
         raise HTTPException(status_code=400, detail="Requirements too short. Please provide more detail.")
-
     try:
-        prompt = build_prompt(
-            request.requirements,
-            request.hourly_rate,
-            request.currency
-        )
-
+        prompt = build_prompt(request.requirements, request.hourly_rate, request.currency)
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
@@ -103,72 +121,41 @@ async def estimate_from_text(request: EstimationRequest):
             ],
             temperature=0.3
         )
-
         result = response.choices[0].message.content
-
         return {
             "status": "success",
             "estimation": result,
-            "requirements_length": len(request.requirements),
             "model_used": "llama-3.3-70b-versatile"
         }
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI Error: {str(e)}")
 
-
-# Route 2 — Estimate from uploaded PDF or Word file
 @app.post("/estimate/upload")
 async def estimate_from_file(
     file: UploadFile = File(...),
     hourly_rate: float = 50.0,
     currency: str = "USD"
 ):
-    # Check file type
-    allowed_types = ["application/pdf", 
-                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                     "text/plain"]
-    
     filename = file.filename.lower()
-    
-    if not (filename.endswith(".pdf") or 
-            filename.endswith(".docx") or 
-            filename.endswith(".txt")):
-        raise HTTPException(
-            status_code=400, 
-            detail="Only PDF, DOCX, and TXT files are supported"
-        )
-
+    if not (filename.endswith(".pdf") or filename.endswith(".docx") or filename.endswith(".txt")):
+        raise HTTPException(status_code=400, detail="Only PDF, DOCX, and TXT files supported")
     try:
         contents = await file.read()
         extracted_text = ""
-
-        # Extract text from PDF
         if filename.endswith(".pdf"):
             pdf_document = pymupdf.open(stream=contents, filetype="pdf")
             for page in pdf_document:
                 extracted_text += page.get_text()
             pdf_document.close()
-
-        # Extract text from Word document
         elif filename.endswith(".docx"):
             doc = docx.Document(io.BytesIO(contents))
             for paragraph in doc.paragraphs:
                 extracted_text += paragraph.text + "\n"
-
-        # Extract text from plain text file
         elif filename.endswith(".txt"):
             extracted_text = contents.decode("utf-8")
-
         if not extracted_text.strip():
-            raise HTTPException(
-                status_code=400, 
-                detail="Could not extract text from file. File may be empty or image-based."
-            )
-
-        # Now estimate using extracted text
+            raise HTTPException(status_code=400, detail="Could not extract text from file")
         prompt = build_prompt(extracted_text, hourly_rate, currency)
-
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
@@ -183,51 +170,17 @@ async def estimate_from_file(
             ],
             temperature=0.3
         )
-
         result = response.choices[0].message.content
-
         return {
             "status": "success",
             "filename": file.filename,
-            "extracted_text_length": len(extracted_text),
             "estimation": result,
             "model_used": "llama-3.3-70b-versatile"
         }
-
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
-
-
-# Route 3 — Health check
-@app.get("/")
-async def root():
-    return {
-        "status": "running",
-        "message": "Project Estimation API is live",
-        "version": "1.0.0"
-    }
-
-
-# Route 4 — Health check endpoint
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
-
-# Route 5 
-from fastapi.responses import StreamingResponse
-import io
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.units import inch
-from reportlab.lib import colors
-from pydantic import BaseModel as PydanticBaseModel
-
-class ExportRequest(PydanticBaseModel):
-    estimation: str
-    project_name: str = "Project Estimation"
 
 @app.post("/export/pdf")
 async def export_pdf(request: ExportRequest):
@@ -254,8 +207,7 @@ async def export_pdf(request: ExportRequest):
         fontSize=14,
         textColor=colors.HexColor('#1e40af'),
         spaceBefore=16,
-        spaceAfter=8,
-        borderPad=4
+        spaceAfter=8
     )
     body_style = ParagraphStyle(
         'CustomBody',
@@ -274,10 +226,7 @@ async def export_pdf(request: ExportRequest):
             story.append(Spacer(1, 8))
             story.append(Paragraph(line.replace('## ', ''), heading_style))
         elif line.startswith('- ') or line.startswith('* '):
-            story.append(Paragraph(
-                '• ' + line.replace('- ', '').replace('* ', ''),
-                body_style
-            ))
+            story.append(Paragraph('• ' + line.replace('- ', '').replace('* ', ''), body_style))
         elif line.strip():
             story.append(Paragraph(line, body_style))
     doc.build(story)
@@ -285,20 +234,11 @@ async def export_pdf(request: ExportRequest):
     return StreamingResponse(
         buffer,
         media_type="application/pdf",
-        headers={
-            "Content-Disposition": f"attachment; filename=estimation.pdf"
-        }
+        headers={"Content-Disposition": f"attachment; filename=estimation.pdf"}
     )
-# rRoute
-class ExcelExportRequest(BaseModel):
-    estimation: str
-    project_name: str = "Project Estimation"
 
 @app.post("/export/excel")
 async def export_excel(request: ExcelExportRequest):
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment
-
     wb = Workbook()
     ws = wb.active
     ws.title = "Estimation"
